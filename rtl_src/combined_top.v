@@ -476,6 +476,17 @@ module combined_top #(
     wire [NUM_OPERATORS-1:0] web2_op;
     wire [95:0] dib1_op [NUM_OPERATORS-1:0];
     wire [95:0] dib2_op [NUM_OPERATORS-1:0];
+    // ---- v2: vector NTT/INTT operator ports (nvec = 0/1 -> single polynomial, GMU protocol)
+    reg  [3:0]  nvec_op  [NUM_OPERATORS-1:0];
+    wire [3:0]  rpoly_op [NUM_OPERATORS-1:0];
+    wire [3:0]  wpoly_op [NUM_OPERATORS-1:0];
+    wire [NUM_OPERATORS-1:0] wfinal_op;
+    // ---- v2 interlocks: sticky "matrix A generated" and "this state's NTT work finished"
+    reg  a_ready = 0, cs0_ntt_seen = 0, cs1_ntt_seen = 0;
+    wire a_ok = a_ready | done_a;
+    reg  vec_exit;   // exit condition of the current vector-NTT state (combinational)
+    reg  w_ready = 0, mh_seen = 0;   // FSM1 produced an unconsumed w / hint ADDs complete
+    reg  mh_decide;                  // MAKEHINT accept/reject decision this cycle (comb)
 
     localparam 
         DECODE_TRUE = 2'd0,
@@ -484,14 +495,16 @@ module combined_top #(
 
     generate
         for (g = 0; g < NUM_OPERATORS; g = g + 1) begin
-            operation_module OPERATOR(
+            operation_module_v2 OPERATOR(
                 clk, rst_op[g], start_op[g], mode_op[g], encode_mode_op[g], done_op[g],
                 // BRAM 1
                 addra1_op[g], addrb1_op[g], doa1_op[g], dob1_op[g],
                 web1_op[g], dib1_op[g],
                 // BRAM 2  
                 addra2_op[g], addrb2_op[g], doa2_op[g],
-                web2_op[g], dib2_op[g]
+                web2_op[g], dib2_op[g],
+                // v2 vector NTT
+                nvec_op[g], rpoly_op[g], wpoly_op[g], wfinal_op[g]
             );
         end
     endgenerate
@@ -668,6 +681,8 @@ module combined_top #(
         
         
         encode_mode_op[0] = STANDARD;
+        nvec_op[0] = 0;
+        vec_exit   = 0;
         rst_op[0]  = 0;
         mode_op[0] = FORWARD_NTT_MODE;
         naddr1_sel_op[0] = addr1_sel_op[0]; 
@@ -677,6 +692,8 @@ module combined_top #(
         mux_ctrl_k = 0;
         
         encode_mode_op[1] = STANDARD;
+        nvec_op[1] = 0;
+        mh_decide  = 0;
         rst_op[1]  = 0;
         mode_op[1] = FORWARD_NTT_MODE;
         naddr1_sel_op[1] = addr1_sel_op[1]; 
@@ -898,8 +915,8 @@ module combined_top #(
             dst_ready_fsm = dst_ready_s; 
         
             // NTT on S1
-            addra_ram1 = {addr1_sel_op[0], addra1_op[0]};
-            addrb_ram1 = {addr1_sel_op[0], addrb1_op[0]};
+            addra_ram1 = {addr1_sel_op[0] + rpoly_op[0], addra1_op[0]};
+            addrb_ram1 = {addr1_sel_op[0] + wpoly_op[0], addrb1_op[0]};
             web_ram1   = web1_op[0];
             dib_ram1   = dib1_op[0];
             doa1_op[0]  = doa_ram1;
@@ -912,7 +929,7 @@ module combined_top #(
             ctr_next    = (valid_o  && ready_o) ? ctr + 1 : ctr;
 
             // wait until NTT is complete
-            nstate0    = ((done_op[0] && addr1_sel_op[0] == K - 1 && sec_lvl == 2) || (done_a && sec_lvl != 2)) ? KG_MULT_AS1 : KG_SAMPLE_S2;
+            nstate0    = ((((done_op[0] && addr1_sel_op[0] == K - 1) || cs0_ntt_seen) && a_ok && sec_lvl == 2) || (done_a && sec_lvl != 2)) ? KG_MULT_AS1 : KG_SAMPLE_S2;
             rst_op[0]    = (done_op[0]) ? 1 : 0;
             naddr1_sel_op[0] = (done_op[0] && addr1_sel_op[0] == K - 1) ? 0 
                              : (done_op[0]) ? addr1_sel_op[0] + 1 : addr1_sel_op[0];
@@ -921,7 +938,7 @@ module combined_top #(
         {2'd0,KG_MULT_AS1}: begin
             // A*s1 - MULT-ACC     
             // multa: s1, multb: a, acc: t   
-            addra_ram1 = {addr1_sel_op[0], addra1_op[0]};
+            addra_ram1 = {addr1_sel_op[0] + rpoly_op[0], addra1_op[0]};
             addra_ram0  = {addr2_sel_op[0], addra2_op[0]};
             addra_ram3  = {addr3_sel_op[0], addrb1_op[0]};
             // write
@@ -958,20 +975,22 @@ module combined_top #(
         end
         {2'd0,KG_NTTI_T}: begin
             // NTTI on T
-            addra_ram3 = {addr1_sel_op[0], addra1_op[0]};
-            addrb_ram3 = {addr1_sel_op[0], addrb1_op[0]};
+            addra_ram3 = {addr1_sel_op[0] + rpoly_op[0], addra1_op[0]};
+            addrb_ram3 = {addr1_sel_op[0] + wpoly_op[0], addrb1_op[0]};
             web_ram3   = web1_op[0];
             dib_ram3   = dib1_op[0];
             doa1_op[0]  = doa_ram3;
             dob1_op[0]  = dob_ram3;
         
             // wait until NTT is complete
-            nstate0    = (done_op[0] && naddr1_sel_op[0] == K-1) ? KG_ADD_T_S2 : KG_NTTI_T;
+            // v2: leave only when the vector is inverted AND rho is loaded into SHAKE
+            vec_exit   = (done_op[0] || cs0_ntt_seen) && (ctr == 5);
+            nvec_op[0] = K;
+            nstate0    = vec_exit ? KG_ADD_T_S2 : KG_NTTI_T;
             rst_op[0]    = (done_op[0]) ? 1 : 0;
-            mode_op[0]  = (done_op[0] && naddr1_sel_op[0] == K-1) ? ADD_MODE : INVERSE_NTT_MODE;
+            mode_op[0]  = vec_exit ? ADD_MODE : INVERSE_NTT_MODE;
             encode_mode_op[0] = ENCODE_TRUE;
-            naddr1_sel_op[0] = (done_op[0] && naddr1_sel_op[0] == K-1) ? 0 
-                             : (done_op[0]) ? addr1_sel_op[0] + 1 : addr1_sel_op[0];
+            naddr1_sel_op[0] = 0;
                              
             // load rho back into Keccak
             k_fsm = 1;
@@ -988,7 +1007,7 @@ module combined_top #(
         end
         {2'd0,KG_ADD_T_S2}: begin
             // ADD T and S2
-            addra_ram3 = {addr1_sel_op[0], addra1_op[0]};
+            addra_ram3 = {addr1_sel_op[0] + rpoly_op[0], addra1_op[0]};
             addra_ram2 = {addr1_sel_op[0], addra2_op[0]};
             doa1_op[0]  = doa_ram3;
             doa2_op[0]  = doa_ram2;
@@ -1218,8 +1237,8 @@ module combined_top #(
             dib_ram0   = {1'd0, samples_a[7*23+:23], 1'd0, samples_a[6*23+:23], 1'd0, samples_a[5*23+:23], 1'd0, samples_a[4*23+:23]};
             
             // NTT on Z
-            addra_ram1 = {addr1_sel_op[0], addra1_op[0]};
-            addrb_ram1 = {addr1_sel_op[0], addrb1_op[0]};
+            addra_ram1 = {addr1_sel_op[0] + rpoly_op[0], addra1_op[0]};
+            addrb_ram1 = {addr1_sel_op[0] + wpoly_op[0], addrb1_op[0]};
             web_ram1   = web1_op[0];
             dib_ram1   = dib1_op[0];
             doa1_op[0]  = doa_ram1;
@@ -1243,24 +1262,26 @@ module combined_top #(
                         
             
             /* --- CTRL Logic --- */
-            ctr_next  = (done_op[0] && addr1_sel_op[0] == L-1) ? 0 
+            // v2: leave only when z is transformed AND t1 is decoded AND tr is squeezed
+            vec_exit  = (done_op[0] || cs0_ntt_seen) && (ctr0 == 4) && (ctr_dec == {K, 6'd0});
+            nvec_op[0] = L;
+            ctr_next  = vec_exit ? 0 
                         : (src_read[2]) ? ctr + 1 : ctr;
             
-            ctr0_next = (done_op[0] && addr1_sel_op[0] == L-1) ? 0 : (dst_write[2]) ? ctr0 + 1 : ctr0;
+            ctr0_next = vec_exit ? 0 : (dst_write[2]) ? ctr0 + 1 : ctr0;
             dst_ready_fsm = (ctr0 < 4) ? 0 : 1;
             
-            nstate0      = (done_op[0] && addr1_sel_op[0] == L-1) ? VY_NTT_T1 : VY_NTT_Z;
+            nstate0      = vec_exit ? VY_NTT_T1 : VY_NTT_Z;
             rst_op[0]   = (done_op[0]) ? 1 : 0;
             mode_op[0]  = FORWARD_NTT_MODE;
-            naddr1_sel_op[0] = (done_op[0] && addr1_sel_op[0] == L-1) ? 0 
-                             : (done_op[0]) ? addr1_sel_op[0] + 1 : addr1_sel_op[0];
+            naddr1_sel_op[0] = 0;
 
         end
         {2'd1,VY_NTT_T1}: begin
             /* --- Datapath MUX --- */
             // NTT on t1
-            addra_ram2 = {addr1_sel_op[0], addra1_op[0]};
-            addrb_ram2 = {addr1_sel_op[0], addrb1_op[0]};
+            addra_ram2 = {addr1_sel_op[0] + rpoly_op[0], addra1_op[0]};
+            addrb_ram2 = {addr1_sel_op[0] + wpoly_op[0], addrb1_op[0]};
             web_ram2   = web1_op[0];
             dib_ram2   = dib1_op[0];
             doa1_op[0]  = doa_ram2;
@@ -1278,15 +1299,17 @@ module combined_top #(
             dib_ram0   = {1'd0, samples_a[7*23+:23], 1'd0, samples_a[6*23+:23], 1'd0, samples_a[5*23+:23], 1'd0, samples_a[4*23+:23]};
             
             /* --- CTRL Logic --- */
-            nstate0      = (done_op[0] && addr1_sel_op[0] == K-1) ? VY_NTT_C : VY_NTT_T1;
+            // v2: leave only when t1 is transformed AND mu is fully squeezed (any message length)
+            vec_exit     = (done_op[0] || cs0_ntt_seen) && ({ctr0, 3'd0} >= mlen_PLUS112);   // last of 14+ceil(mlen/8) words
+            nvec_op[0]   = K;
+            nstate0      = vec_exit ? VY_NTT_C : VY_NTT_T1;
             rst_op[0]   = (done_op[0]) ? 1 : 0;
             mode_op[0]  = FORWARD_NTT_MODE;
-            naddr1_sel_op[0] = (done_op[0] && addr1_sel_op[0] == K-1) ? 0 
-                             : (done_op[0]) ? addr1_sel_op[0] + 1 : addr1_sel_op[0];
+            naddr1_sel_op[0] = 0;
                     
                              
             // load tr back into 
-            ctr0_next = (done_op[0] && addr1_sel_op[0] == K-1) ? 0 
+            ctr0_next = vec_exit ? 0 
                         : (src_read[2] || dst_write[2]) ? ctr0 + 1 : ctr0;
 
             k_fsm = 1;
@@ -1340,14 +1363,14 @@ module combined_top #(
             /* --- CTRL Logic --- */
             mode_op[0]  = FORWARD_NTT_MODE;
             
-            nstate0      = ((done_op[0] && sec_lvl != 5) || (done_a && sec_lvl == 5)) ? VY_MULT_AZ : VY_NTT_C;
-            rst_op[0]   = ((done_op[0] && sec_lvl != 5) || (done_a && sec_lvl == 5)) ? 1 : 0;
+            nstate0      = (((done_op[0] || cs0_ntt_seen) && a_ok && sec_lvl != 5) || (done_a && sec_lvl == 5)) ? VY_MULT_AZ : VY_NTT_C;
+            rst_op[0]   = (done_op[0] || nstate0 == VY_MULT_AZ) ? 1 : 0;
             
         end
         {2'd1,VY_MULT_AZ}: begin
             /* --- Datapath MUX --- */
             // multa: z, multb: a, acc: t   
-            addra_ram1 = {addr1_sel_op[0], addra1_op[0]};
+            addra_ram1 = {addr1_sel_op[0] + rpoly_op[0], addra1_op[0]};
             addra_ram0  = {addr2_sel_op[0], addra2_op[0]};
             addra_ram2  = {addr3_sel_op[0], addrb1_op[0]} | 512;
             // write
@@ -1387,7 +1410,7 @@ module combined_top #(
         {2'd1,VY_MULT_CT1}: begin
             /* --- Datapath MUX --- */
             // multa: t1, multb: c, acc: none   
-            addra_ram2  = {addr1_sel_op[0], addra1_op[0]};
+            addra_ram2  = {addr1_sel_op[0] + rpoly_op[0], addra1_op[0]};
             addra_ram3  = addra2_op[0];
             // write
             addrb_ram2 = {addr1_sel_op[0], addrb2_op[0]};
@@ -1416,8 +1439,8 @@ module combined_top #(
             /* --- Datapath MUX --- */
             mode_op[0]  = (done_op[0] && addr1_sel_op[0] == K-1) ? INVERSE_NTT_MODE : SUB_MODE;
             // SUB Az and ct1
-            addra_ram2 = {addr1_sel_op[0], addra1_op[0]} | 512;
-            addrb_ram2 = {addr1_sel_op[0], addra1_op[0]};
+            addra_ram2 = {addr1_sel_op[0] + rpoly_op[0], addra1_op[0]} | 512;
+            addrb_ram2 = {addr1_sel_op[0] + rpoly_op[0], addra1_op[0]};
             doa1_op[0]  = doa_ram2;
             doa2_op[0]  = dob_ram2;
             
@@ -1435,24 +1458,26 @@ module combined_top #(
         {2'd1,VY_INTT}: begin
             /* --- Datapath MUX --- */
             // NTTI on Z (Az-ct1)
-            addra_ram1 = {addr1_sel_op[0], addra1_op[0]};
-            addrb_ram1 = {addr1_sel_op[0], addrb1_op[0]};
+            addra_ram1 = {addr1_sel_op[0] + rpoly_op[0], addra1_op[0]};
+            addrb_ram1 = {addr1_sel_op[0] + wpoly_op[0], addrb1_op[0]};
             web_ram1   = web1_op[0];
             dib_ram1   = dib1_op[0];
             doa1_op[0]  = doa_ram1;
             dob1_op[0]  = dob_ram1;
             
             /* --- CTRL Logic --- */
-            naddr1_sel_op[0] = (done_op[0] && addr1_sel_op[0] == K-1) ? 0 
-                             : (done_op[0] ) ? addr1_sel_op[0] + 1 : addr1_sel_op[0];
-            nstate0    = (done_op[0] && addr1_sel_op[0] == K-1) ? VY_GENW1 : VY_INTT;
+            // v2: leave only when the vector is inverted AND mu is loaded into SHAKE
+            vec_exit   = (done_op[0] || cs0_ntt_seen) && (ctr0 == 10);
+            nvec_op[0] = K;
+            naddr1_sel_op[0] = 0;
+            nstate0    = vec_exit ? VY_GENW1 : VY_INTT;
             rst_op[0]  = (done_op[0]) ? 1 : 0;
             mode_op[0] =  INVERSE_NTT_MODE;
             encode_mode_op[0] = ENCODE_TRUE;
             
             
             // load tr back into 
-            ctr0_next = (done_op[0] && addr1_sel_op[0] == K-1) ? 0 
+            ctr0_next = vec_exit ? 0 
                         : (src_read[2] || dst_write[2]) ? ctr0 + 1 : ctr0;
             k_fsm = 1;
             if (ctr0 == 0) begin
@@ -1671,8 +1696,8 @@ module combined_top #(
             dib_ram0   = {1'd0, samples_a[7*23+:23], 1'd0, samples_a[6*23+:23], 1'd0, samples_a[5*23+:23], 1'd0, samples_a[4*23+:23]};
             
             // NTT S1
-            addra_ram3 = {addr1_sel_op[1], addra1_op[1]};
-            addrb_ram3 = {addr1_sel_op[1], addrb1_op[1]};
+            addra_ram3 = {addr1_sel_op[1] + rpoly_op[1], addra1_op[1]};
+            addrb_ram3 = {addr1_sel_op[1] + wpoly_op[1], addrb1_op[1]};
             web_ram3   = web1_op[1];
             dib_ram3   = dib1_op[1];
             doa1_op[1]  = doa_ram3;
@@ -1717,8 +1742,8 @@ module combined_top #(
             dib_ram0   = {1'd0, samples_a[7*23+:23], 1'd0, samples_a[6*23+:23], 1'd0, samples_a[5*23+:23], 1'd0, samples_a[4*23+:23]};
             
             // NTT S2
-            addra_ram5 = {addr1_sel_op[1], addra1_op[1]};
-            addrb_ram5 = {addr1_sel_op[1], addrb1_op[1]};
+            addra_ram5 = {addr1_sel_op[1] + rpoly_op[1], addra1_op[1]};
+            addrb_ram5 = {addr1_sel_op[1] + wpoly_op[1], addrb1_op[1]};
             web_ram5   = web1_op[1];
             dib_ram5   = dib1_op[1];
             doa1_op[1]  = doa_ram5;
@@ -1739,8 +1764,8 @@ module combined_top #(
         {2'd2,FSM0_NTT_T0}: begin
             /* --- Datapath MUX --- */ 
             // NTT S2
-            addra_ram3 = 512 | {addr1_sel_op[1], addra1_op[1]};
-            addrb_ram3 = 512 | {addr1_sel_op[1], addrb1_op[1]};
+            addra_ram3 = 512 | {addr1_sel_op[1] + rpoly_op[1], addra1_op[1]};
+            addrb_ram3 = 512 | {addr1_sel_op[1] + wpoly_op[1], addrb1_op[1]};
             web_ram3   = web1_op[1];
             dib_ram3   = dib1_op[1];
             doa1_op[1]  = doa_ram3;
@@ -1850,8 +1875,8 @@ module combined_top #(
         FSM1_NTT_Y: begin
             /* --- Datapath MUX --- */ 
             // NTT Y
-            addra_ram1 = {fsm1_even, 9'd0} | {addr1_sel_op[0], addra1_op[0]};
-            addrb_ram1 = {fsm1_even, 9'd0} | {addr1_sel_op[0], addrb1_op[0]};
+            addra_ram1 = {fsm1_even, 9'd0} | {addr1_sel_op[0] + rpoly_op[0], addra1_op[0]};
+            addrb_ram1 = {fsm1_even, 9'd0} | {addr1_sel_op[0] + wpoly_op[0], addrb1_op[0]};
             web_ram1   = web1_op[0];
             dib_ram1   = dib1_op[0];
             doa1_op[0]  = doa_ram1;
@@ -1859,8 +1884,8 @@ module combined_top #(
         
             /* --- CTRL Logic --- */ 
             if (sec_lvl == 2 || cstate0 == 7) begin
-                nstate1    = (done_op[0] && addr1_sel_op[0] == L-1) ? FSM1_MULT_A_Y : FSM1_NTT_Y;
-                rst_op[0]   = (done_op[0]) ? 1 : 0;
+                nstate1    = (((done_op[0] && addr1_sel_op[0] == L-1) || cs1_ntt_seen) && a_ok) ? FSM1_MULT_A_Y : FSM1_NTT_Y;
+                rst_op[0]   = (done_op[0] || nstate1 == FSM1_MULT_A_Y) ? 1 : 0;
             end else begin
                 // sampleA is bottleneck
                 nstate1    = (done_a) ? FSM1_MULT_A_Y : FSM1_NTT_Y;
@@ -1875,7 +1900,7 @@ module combined_top #(
         FSM1_MULT_A_Y: begin
             
             // multa: y, multb: a, acc: w   
-            addra_ram1 = {fsm1_even, 9'd0} | {addr1_sel_op[0], addra1_op[0]};
+            addra_ram1 = {fsm1_even, 9'd0} | {addr1_sel_op[0] + rpoly_op[0], addra1_op[0]};
             addra_ram0  = {addr2_sel_op[0], addra2_op[0]};
             addra_ram2  = {addr3_sel_op[0], addrb1_op[0]};
             // write
@@ -1914,22 +1939,22 @@ module combined_top #(
         FSM1_NTTI_W: begin
             /* --- Datapath MUX --- */ 
             // NTTI W
-            addra_ram2 = {addr1_sel_op[0], addra1_op[0]};
-            addrb_ram2 = {addr1_sel_op[0], addrb1_op[0]};
+            addra_ram2 = {addr1_sel_op[0] + rpoly_op[0], addra1_op[0]};
+            addrb_ram2 = {addr1_sel_op[0] + wpoly_op[0], addrb1_op[0]};
             web_ram2   = web1_op[0];
             dib_ram2   = dib1_op[0];
             doa1_op[0]  = doa_ram2;
             dob1_op[0]  = dob_ram2;
         
             /* --- CTRL Logic --- */ 
-            nstate1    = (done_op[0] && addr1_sel_op[0] == K-1) ? FSM1_STALL : FSM1_NTTI_W;
-            nstart_fsm2 = (done_op[0] && addr1_sel_op[0] == K-1) ? 1 : 0;
+            nvec_op[0] = K;   // v2 vector INTT
+            nstate1    = (done_op[0]) ? FSM1_STALL : FSM1_NTTI_W;
+            nstart_fsm2 = (done_op[0]) ? 1 : 0;
             
             rst_op[0]   = (done_op[0]) ? 1 : 0;
             mode_op[0]  = INVERSE_NTT_MODE;
             encode_mode_op[0] = ENCODE_TRUE;
-            naddr1_sel_op[0] = (done_op[0] && addr1_sel_op[0] == K-1) ? 0 
-                             : (done_op[0]) ? addr1_sel_op[0] + 1 : addr1_sel_op[0];
+            naddr1_sel_op[0] = 0;
         end
         endcase
         
@@ -1994,8 +2019,8 @@ module combined_top #(
         FSM2_NTT_C: begin
             /* --- Datapath MUX --- */ 
             // NTTI W
-            addra_ram0 = 3584 | {addr1_sel_op[1], addra1_op[1]};
-            addrb_ram0 = 3584 | {addr1_sel_op[1], addrb1_op[1]};
+            addra_ram0 = 3584 | {addr1_sel_op[1] + rpoly_op[1], addra1_op[1]};
+            addrb_ram0 = 3584 | {addr1_sel_op[1] + wpoly_op[1], addrb1_op[1]};
             web_ram0   = web1_op[1];
             dib_ram0   = dib1_op[1];
             doa1_op[1]  = doa_ram0;
@@ -2011,9 +2036,9 @@ module combined_top #(
         FSM2_MULTACC: begin
             // y+c*s1
             // multa: c, multb: s1, acc: y   
-            addra_ram3 = {addr1_sel_op[1], addra1_op[1]};
+            addra_ram3 = {addr1_sel_op[1] + rpoly_op[1], addra1_op[1]};
             addra_ram0 = 3584 | addra2_op[1];
-            addrb_ram1 = {!fsm1_even, 9'd0} | {addr1_sel_op[1], addrb1_op[1]};
+            addrb_ram1 = {!fsm1_even, 9'd0} | {addr1_sel_op[1] + wpoly_op[1], addrb1_op[1]};
             // write
             addrb_ram6 = {addr1_sel_op[1], addrb2_op[1]};
             web_ram6   = web2_op[1];
@@ -2037,7 +2062,7 @@ module combined_top #(
         end
         FSM2_MULT_CS2: begin
             // multa: c, multb: s2, acc: 0   
-            addra_ram5 = {addr1_sel_op[1], addra1_op[1]};
+            addra_ram5 = {addr1_sel_op[1] + rpoly_op[1], addra1_op[1]};
             addra_ram0 = 3584 | addra2_op[1];
             // write
             addrb_ram5 = 512 | {addr1_sel_op[1], addrb2_op[1]};
@@ -2062,7 +2087,7 @@ module combined_top #(
         end
         FSM2_MULT_CT0: begin
             // multa: c, multb: t0, acc: 0   
-            addra_ram3 = 512 | {addr1_sel_op[1], addra1_op[1]};
+            addra_ram3 = 512 | {addr1_sel_op[1] + rpoly_op[1], addra1_op[1]};
             addrb_ram0 = 3584 | addra2_op[1];
             // write
             addrb_ram6 = 512 | {addr1_sel_op[1], addrb2_op[1]};
@@ -2088,8 +2113,8 @@ module combined_top #(
         FSM2_NTTI_Z: begin
             /* --- Datapath MUX --- */ 
             // NTTI Z
-            addra_ram6 = {addr1_sel_op[1], addra1_op[1]};
-            addrb_ram6 = {addr1_sel_op[1], addrb1_op[1]};
+            addra_ram6 = {addr1_sel_op[1] + rpoly_op[1], addra1_op[1]};
+            addrb_ram6 = {addr1_sel_op[1] + wpoly_op[1], addrb1_op[1]};
             web_ram6   = web1_op[1];
             dib_ram6   = dib1_op[1];
             doa1_op[1]  = doa_ram6;
@@ -2097,44 +2122,44 @@ module combined_top #(
         
             // check Norm
             mode_norm = G1_SUB_BETA ;
-            validi_norm = (web1_op[1] && ctrfsm2 >= 192) ? 1 : 0;
+            validi_norm = (web1_op[1] && wfinal_op[1]) ? 1 : 0;   // v2: final-pass writes
             di_norm = dib1_op[1];
             ctrfsm2_next = (done_op[1]) ? 0 
                         : (web1_op[1]) ? ctrfsm2 + 1 : ctrfsm2;
         
             /* --- CTRL Logic --- */ 
-            nstate2    = (done_op[1] && addr1_sel_op[1] == L-1) ? FSM2_NTTI_CS2 : FSM2_NTTI_Z;
+            nvec_op[1] = L;   // v2 vector INTT
+            nstate2    = (done_op[1]) ? FSM2_NTTI_CS2 : FSM2_NTTI_Z;
             
             rst_op[1]   = (done_op[1]) ? 1 : 0;
             mode_op[1]  = INVERSE_NTT_MODE;
             encode_mode_op[1] = ENCODE_TRUE;
-            naddr1_sel_op[1] = (done_op[1] && addr1_sel_op[1] == L-1) ? 0 
-                             : (done_op[1]) ? addr1_sel_op[1] + 1 : addr1_sel_op[1];
+            naddr1_sel_op[1] = 0;
         end
         FSM2_NTTI_CS2: begin
             /* --- Datapath MUX --- */ 
             // NTTI CS2
-            addra_ram5 = 512 | {addr1_sel_op[1], addra1_op[1]};
-            addrb_ram5 = 512 | {addr1_sel_op[1], addrb1_op[1]};
+            addra_ram5 = 512 | {addr1_sel_op[1] + rpoly_op[1], addra1_op[1]};
+            addrb_ram5 = 512 | {addr1_sel_op[1] + wpoly_op[1], addrb1_op[1]};
             web_ram5   = web1_op[1];
             dib_ram5   = dib1_op[1];
             doa1_op[1]  = doa_ram5;
             dob1_op[1]  = dob_ram5;
         
             /* --- CTRL Logic --- */ 
-            nstate2    = (done_op[1] && addr1_sel_op[1] == K-1) ? FSM2_NTTI_CT0 : FSM2_NTTI_CS2;
+            nvec_op[1] = K;   // v2 vector INTT
+            nstate2    = (done_op[1]) ? FSM2_NTTI_CT0 : FSM2_NTTI_CS2;
             
             rst_op[1]   = (done_op[1]) ? 1 : 0;
             mode_op[1]  = INVERSE_NTT_MODE;
             encode_mode_op[1] = ENCODE_TRUE;
-            naddr1_sel_op[1] = (done_op[1] && addr1_sel_op[1] == K-1) ? 0 
-                             : (done_op[1]) ? addr1_sel_op[1] + 1 : addr1_sel_op[1];
+            naddr1_sel_op[1] = 0;
         end
         FSM2_NTTI_CT0: begin
             /* --- Datapath MUX --- */ 
             // NTTI CT0
-            addra_ram6 = 512 | {addr1_sel_op[1], addra1_op[1]};
-            addrb_ram6 = 512 | {addr1_sel_op[1], addrb1_op[1]};
+            addra_ram6 = 512 | {addr1_sel_op[1] + rpoly_op[1], addra1_op[1]};
+            addrb_ram6 = 512 | {addr1_sel_op[1] + wpoly_op[1], addrb1_op[1]};
             web_ram6   = web1_op[1];
             dib_ram6   = dib1_op[1];
             doa1_op[1]  = doa_ram6;
@@ -2143,27 +2168,27 @@ module combined_top #(
             
             // check norm
             mode_norm   = G2 ;
-            validi_norm = (web1_op[1] && ctrfsm2 > 192) ? 1 : 0;
+            validi_norm = (web1_op[1] && wfinal_op[1]) ? 1 : 0;   // v2: final-pass writes
             di_norm = dib1_op[1];
             ctrfsm2_next = (done_op[1]) ? 0 
                         : (web1_op[1]) ? ctrfsm2 + 1 : ctrfsm2;
             
         
             /* --- CTRL Logic --- */ 
-            nstate2    = (done_op[1] && addr1_sel_op[1] == K-1) ? FSM2_SUB_W0_CS2 : FSM2_NTTI_CT0;
+            nvec_op[1] = K;   // v2 vector INTT
+            nstate2    = (done_op[1]) ? FSM2_SUB_W0_CS2 : FSM2_NTTI_CT0;
             
             
             
             rst_op[1]   = (done_op[1]) ? 1 : 0;
             mode_op[1]  = INVERSE_NTT_MODE;
             encode_mode_op[1] = ENCODE_TRUE;
-            naddr1_sel_op[1] = (done_op[1] && addr1_sel_op[1] == K-1) ? 0 
-                             : (done_op[1]) ? addr1_sel_op[1] + 1 : addr1_sel_op[1];
+            naddr1_sel_op[1] = 0;
         end
         FSM2_SUB_W0_CS2: begin
             /* --- Datapath MUX --- */ 
             // W0 - CS2: addra1: W0, addra2: CS2, addrb2:w0-cs2
-            addra_ram4 = 512 | {addr1_sel_op[1], addra1_op[1]};
+            addra_ram4 = 512 | {addr1_sel_op[1] + rpoly_op[1], addra1_op[1]};
             addra_ram5 = 512 | {addr1_sel_op[1], addra2_op[1]};
             
             doa1_op[1]  = doa_ram4;
@@ -2189,7 +2214,7 @@ module combined_top #(
         FSM2_MAKEHINT: begin
             /* --- Datapath MUX --- */ 
             // W0 - CS2: addra1: W0, addra2: CS2, addrb2:w0-cs2
-            addra_ram6 = 512 | {addr1_sel_op[1], addra1_op[1]};
+            addra_ram6 = 512 | {addr1_sel_op[1] + rpoly_op[1], addra1_op[1]};
             addra_ram5 = 512 | {addr1_sel_op[1], addra2_op[1]};
             
             doa1_op[1]  = doa_ram6;
@@ -2214,7 +2239,8 @@ module combined_top #(
             naddr1_sel_op[1] = (done_op[1] && addr1_sel_op[1] == K-1) ? 0 
                              : (done_op[1]) ? addr1_sel_op[1] + 1 : addr1_sel_op[1];
                              
-            if ((done_op[1] && addr1_sel_op[1] == K-1 && sec_lvl != 5) || (sec_lvl == 5 && done_op[0] && addr1_sel_op[0] == K-1)) begin
+            mh_decide = ((done_op[1] && addr1_sel_op[1] == K-1) || mh_seen) && (w_ready || nstart_fsm2);
+            if (mh_decide) begin
                 if (reject_mh || norm_rejected) begin
                     nstate2 = FSM2_DECOMP;
                     rst_mh  = 1;
@@ -2324,7 +2350,7 @@ module combined_top #(
             
                 ctr <= (done_a) ? 0 : ctr_next;
                 addr1_sel_op[0] <= naddr1_sel_op[0]; 
-                start_op[0]     <= ((done_op[0] && ~(addr1_sel_op[0] == K - 1 && sec_lvl != 2)) || (done_a && sec_lvl != 2)) ? 1 : 0;
+                start_op[0]     <= ((done_op[0] && addr1_sel_op[0] != K - 1) || (nstate0 == KG_MULT_AS1)) ? 1 : 0;
             end
             {2'd0,KG_MULT_AS1}: begin
                 start_op[0]     <= (addr3_sel_op[0] != (K-1)*(L-1) && done_op[0]) ? 1 : 0;
@@ -2336,10 +2362,10 @@ module combined_top #(
             end
             {2'd0,KG_NTTI_T}: begin
                 addr1_sel_op[0] <= naddr1_sel_op[0]; 
-                start_op[0]     <= (done_op[0]) ? 1 : 0;
+                start_op[0]     <= (nstate0 == KG_ADD_T_S2) ? 1 : 0;
                 
                 rho <= (src_read[2] && ~src_ready_fsm && ctr > 0) ?  {rho[255-64:0], 64'd0} : rho;
-                ctr <= (done_op[0] && addr1_sel_op[0] == K-1) ? 0 : ctr_next;
+                ctr <= (nstate0 == KG_ADD_T_S2) ? 0 : ctr_next;
             end
             {2'd0,KG_ADD_T_S2}: begin
                 addr1_sel_op[0] <= naddr1_sel_op[0]; 
@@ -2408,7 +2434,7 @@ module combined_top #(
             {2'd1,VY_NTT_Z}: begin
                 ctr_dec <= (valid_o_dec) ? ctr_dec + 1 : ctr_dec;
                 addr1_sel_op[0] <= naddr1_sel_op[0]; 
-                start_op[0]     <= (done_op[0]) ? 1 : 0;
+                start_op[0]     <= (nstate0 == VY_NTT_T1) ? 1 : 0;
                 
                 TR <= (dst_write[2]) ? {TR[255-64:0], dout[2]} : TR;
             end
@@ -2418,10 +2444,10 @@ module combined_top #(
                 
                 mlen <= (ready_i && valid_i && ctr0 == 1) ? data_i[31:0] : mlen;
                 addr1_sel_op[0] <= naddr1_sel_op[0]; 
-                start_op[0]     <= (done_op[0]) ? 1 : 0;
+                start_op[0]     <= (nstate0 == VY_NTT_C) ? 1 : 0;
             end
             {2'd1,VY_NTT_C}: begin
-                start_op[0]     <= ((done_op[0] && sec_lvl != 5) || (done_a && sec_lvl == 5)) ? 1 : 0;
+                start_op[0]     <= (nstate0 == VY_MULT_AZ) ? 1 : 0;
             end
             {2'd1,VY_MULT_AZ}: begin
                 start_op[0]     <= (done_op[0]) ? 1 : 0; 
@@ -2443,7 +2469,7 @@ module combined_top #(
             end
             {2'd1,VY_INTT}: begin
                 addr1_sel_op[0] <= naddr1_sel_op[0]; 
-                start_op[0]     <= (done_op[0] && addr1_sel_op[0] != K-1) ? 1 : 0;
+                start_op[0]     <= 0;
                 
                 MU <= (src_read[2] && ctr0 > 1) ? {MU[512-64:0], 64'd0} : MU;
             end
@@ -2490,14 +2516,14 @@ module combined_top #(
             start_op[0] <= 1;
         end
         FSM1_NTT_Y: begin
-            start_op[0] <= (rst_op[0]) ? 1 : 0; 
+            start_op[0] <= ((rst_op[0] && !(done_op[0] && addr1_sel_op[0] == L-1)) || nstate1 == FSM1_MULT_A_Y) ? 1 : 0;
         end
         FSM1_MULT_A_Y: begin
             start_op[0] <= (rst_op[0]) ? 1 : 0; 
         end
         FSM1_NTTI_W: begin
-            start_op[0] <= (rst_op[0] && addr1_sel_op[0] != K-1) ? 1 : 0; 
-            fsm1_even <= (rst_op[0] && addr1_sel_op[0] == K-1) ? ~fsm1_even : fsm1_even;
+            start_op[0] <= 0;
+            fsm1_even <= (rst_op[0]) ? ~fsm1_even : fsm1_even;
         end
         endcase
         
@@ -2531,10 +2557,9 @@ module combined_top #(
             start_op[1] <= (rst_op[1]) ? 1 : 0;
         end
         FSM2_MAKEHINT: begin
-            start_op[1] <= (rst_op[1]) ? 1 : 0;
-            
-            if ((done_op[1] && addr1_sel_op[1] == K-1 && sec_lvl != 5) || (sec_lvl == 5 && done_op[0] && addr1_sel_op[0] == K-1)) begin
-                norm_rejected <= 0; 
+            start_op[1] <= (rst_op[1] && !(done_op[1] && addr1_sel_op[1] == K-1)) ? 1 : 0;
+            if (mh_decide) begin
+                norm_rejected <= 0;
             end
         end
         endcase
@@ -2550,4 +2575,30 @@ module combined_top #(
         end
     end
     
+    // v2 interlock flags
+    always @(posedge clk) begin
+        if (start_a)     a_ready <= 1'b0;
+        else if (done_a) a_ready <= 1'b1;
+
+        if (nstate0 != cstate0) cs0_ntt_seen <= 1'b0;
+        else if (({mode, cstate0} == {2'd0, KG_SAMPLE_S2} && done_op[0] && addr1_sel_op[0] == K - 1) ||
+                 ({mode, cstate0} == {2'd1, VY_NTT_C} && done_op[0]) ||
+                 ({mode, cstate0} == {2'd1, VY_NTT_Z} && done_op[0]) ||
+                 ({mode, cstate0} == {2'd1, VY_NTT_T1} && done_op[0]) ||
+                 ({mode, cstate0} == {2'd1, VY_INTT} && done_op[0]) ||
+                 ({mode, cstate0} == {2'd0, KG_NTTI_T} && done_op[0]))
+            cs0_ntt_seen <= 1'b1;
+
+        if (start_a)                                             w_ready <= 1'b0;
+        else if (nstate2 == FSM2_DECOMP && cstate2 != FSM2_DECOMP) w_ready <= 1'b0;   // w consumed
+        else if (nstart_fsm2)                                    w_ready <= 1'b1;   // FSM1 finished a w
+
+        if (nstate2 != cstate2) mh_seen <= 1'b0;
+        else if (cstate2 == FSM2_MAKEHINT && done_op[1] && addr1_sel_op[1] == K - 1) mh_seen <= 1'b1;
+
+        if (nstate1 != cstate1) cs1_ntt_seen <= 1'b0;
+        else if (mode == 2'd2 && cstate1 == FSM1_NTT_Y && done_op[0] && addr1_sel_op[0] == L - 1)
+            cs1_ntt_seen <= 1'b1;
+    end
+
 endmodule
